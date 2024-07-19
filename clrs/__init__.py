@@ -21,6 +21,7 @@ from clrs._src import algorithms
 from clrs._src import clrs_text
 from clrs._src import decoders
 from clrs._src import processors
+from clrs._src import specs
 
 from clrs._src.dataset import chunkify
 from clrs._src.dataset import CLRSDataset
@@ -58,7 +59,7 @@ from clrs._src.specs import SPECS
 from clrs._src.specs import Stage
 from clrs._src.specs import Type
 
-__version__ = "2.0.0"
+__version__ = "2.0.1"
 
 __all__ = (
     "ALGO_IDX_INPUT_NAME",
@@ -77,6 +78,7 @@ __all__ = (
     "process_permutations",
     "process_pred_as_input",
     "process_random_pos",
+    "specs",
     "evaluate",
     "evaluate_hints",
     "Features",
