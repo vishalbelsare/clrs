@@ -17,12 +17,12 @@
 
 import abc
 import collections
+import copy
 import inspect
+import itertools
 import types
-
 from typing import Any, Callable, List, Optional, Tuple
 from absl import logging
-
 from clrs._src import algorithms
 from clrs._src import probing
 from clrs._src import specs
@@ -64,6 +64,7 @@ CLRS30 = types.MappingProxyType({
 
 class Sampler(abc.ABC):
   """Sampler abstract base class."""
+  CAN_TRUNCATE_INPUT_DATA = None
 
   def __init__(
       self,
@@ -73,6 +74,7 @@ class Sampler(abc.ABC):
       *args,
       seed: Optional[int] = None,
       track_max_steps: bool = True,
+      truncate_decimals: int | None = None,
       **kwargs,
   ):
     """Initializes a `Sampler`.
@@ -93,6 +95,8 @@ class Sampler(abc.ABC):
         Also, we get an initial value for max_steps by generating 1000 samples,
         which will slow down initialization. If uniform shape of the batches is
         not a concern, set `track_max_steps` to False.
+      truncate_decimals: If not None, the sampler will truncate the input data
+        of the algorithm.
       **kwargs: Algorithm kwargs.
     """
 
@@ -104,14 +108,18 @@ class Sampler(abc.ABC):
     self._args = args
     self._kwargs = kwargs
     self._track_max_steps = track_max_steps
+    self._truncate_decimals = truncate_decimals
 
     if num_samples < 0:
-      logging.warning('Sampling dataset on-the-fly, unlimited samples.')
+      logging.log_first_n(
+          logging.WARNING, 'Sampling dataset on-the-fly, unlimited samples.', 1
+      )
       if track_max_steps:
         # Get an initial estimate of max hint length
         self.max_steps = -1
         for _ in range(1000):
           data = self._sample_data(*args, **kwargs)
+          data = self._trunc_array(data)
           _, probes = algorithm(*data)
           _, _, hint = probing.split_stages(probes, spec)
           for dp in hint:
@@ -124,6 +132,15 @@ class Sampler(abc.ABC):
        self._lengths) = self._make_batch(num_samples, spec, 0, algorithm, *args,
                                          **kwargs)
 
+  def __init_subclass__(cls, **kwargs):
+    super().__init_subclass__(**kwargs)
+    # Check that the subclass has overridden CAN_TRUNCATE_INPUT_DATA
+    if getattr(cls, 'CAN_TRUNCATE_INPUT_DATA', None) is None:
+      raise NotImplementedError(
+          f'{cls.__name__} must define class attribute'
+          " 'CAN_TRUNCATE_INPUT_DATA'."
+      )
+
   def _make_batch(self, num_samples: int, spec: specs.Spec, min_length: int,
                   algorithm: Algorithm, *args, **kwargs):
     """Generate a batch of data."""
@@ -133,6 +150,7 @@ class Sampler(abc.ABC):
 
     for _ in range(num_samples):
       data = self._sample_data(*args, **kwargs)
+      data = self._trunc_array(data)
       _, probes = algorithm(*data)
       inp, outp, hint = probing.split_stages(probes, spec)
       inputs.append(inp)
@@ -179,9 +197,9 @@ class Sampler(abc.ABC):
         # Returns a fixed-size random batch.
         indices = self._rng.choice(self._num_samples, (batch_size,),
                                    replace=True)
-        inputs = _subsample_data(self._inputs, indices, axis=0)
-        outputs = _subsample_data(self._outputs, indices, axis=0)
-        hints = _subsample_data(self._hints, indices, axis=1)
+        inputs = _subsample_data(self._inputs, indices, axis=0)  # pyrefly: ignore[bad-argument-type]
+        outputs = _subsample_data(self._outputs, indices, axis=0)  # pyrefly: ignore[bad-argument-type]
+        hints = _subsample_data(self._hints, indices, axis=1)  # pyrefly: ignore[bad-argument-type]
         lengths = self._lengths[indices]
 
     else:
@@ -271,6 +289,34 @@ class Sampler(abc.ABC):
     mat[1:n+1, n+1:n+m+1] = self._rng.binomial(1, p, size=(n, m))
     return mat
 
+  def _trunc_array(self, data: Any) -> List[_Array]:
+    """Truncates the data if needed."""
+    data = copy.deepcopy(data)
+
+    if not self._truncate_decimals:
+      return data
+
+    for index in range(len(data)):
+      input_data = data[index]
+      if not (_is_float_array(input_data) or isinstance(input_data, float)):
+        continue
+
+      data[index] = np.trunc(input_data * 10**self._truncate_decimals) / (
+          10**self._truncate_decimals
+      )
+
+      if isinstance(input_data, float):
+        data[index] = float(data[index])
+
+    return data
+
+
+def _is_float_array(data: Any) -> bool:
+  """Checks if the given data is a float numpy array."""
+  if isinstance(data, np.ndarray):
+    return issubclass(data.dtype.type, np.floating)
+  return False
+
 
 def build_sampler(
     name: str,
@@ -278,6 +324,7 @@ def build_sampler(
     *args,
     seed: Optional[int] = None,
     track_max_steps: bool = True,
+    truncate_decimals: int | None = None,
     **kwargs,
 ) -> Tuple[Sampler, specs.Spec]:
   """Builds a sampler. See `Sampler` documentation."""
@@ -299,6 +346,7 @@ def build_sampler(
       num_samples,
       seed=seed,
       track_max_steps=track_max_steps,
+      truncate_decimals=truncate_decimals,
       *args,
       **clean_kwargs,
   )
@@ -307,6 +355,7 @@ def build_sampler(
 
 class SortingSampler(Sampler):
   """Sorting sampler. Generates a random sequence of U[0, 1]."""
+  CAN_TRUNCATE_INPUT_DATA = True
 
   def _sample_data(
       self,
@@ -320,6 +369,7 @@ class SortingSampler(Sampler):
 
 class SearchSampler(Sampler):
   """Search sampler. Generates a random sequence and target (of U[0, 1])."""
+  CAN_TRUNCATE_INPUT_DATA = True
 
   def _sample_data(
       self,
@@ -335,6 +385,7 @@ class SearchSampler(Sampler):
 
 class MaxSubarraySampler(Sampler):
   """Maximum subarray sampler. Generates a random sequence of U[-1, 1]."""
+  CAN_TRUNCATE_INPUT_DATA = True
 
   def _sample_data(
       self,
@@ -348,6 +399,7 @@ class MaxSubarraySampler(Sampler):
 
 class LCSSampler(Sampler):
   """Longest Common Subsequence sampler. Generates two random ATCG strings."""
+  CAN_TRUNCATE_INPUT_DATA = False
 
   def _sample_data(
       self,
@@ -366,6 +418,7 @@ class LCSSampler(Sampler):
 
 class OptimalBSTSampler(Sampler):
   """Optimal BST sampler. Samples array of probabilities, splits it into two."""
+  CAN_TRUNCATE_INPUT_DATA = True
 
   def _sample_data(
       self,
@@ -381,6 +434,7 @@ class OptimalBSTSampler(Sampler):
 
 class ActivitySampler(Sampler):
   """Activity sampler. Samples start and finish times from U[0, 1]."""
+  CAN_TRUNCATE_INPUT_DATA = True
 
   def _sample_data(
       self,
@@ -395,6 +449,7 @@ class ActivitySampler(Sampler):
 
 class TaskSampler(Sampler):
   """Task sampler. Samples deadlines (integers) and values (U[0, 1])."""
+  CAN_TRUNCATE_INPUT_DATA = True
 
   def _sample_data(
       self,
@@ -412,6 +467,7 @@ class TaskSampler(Sampler):
 
 class DfsSampler(Sampler):
   """DFS sampler."""
+  CAN_TRUNCATE_INPUT_DATA = False
 
   def _sample_data(
       self,
@@ -426,6 +482,7 @@ class DfsSampler(Sampler):
 
 class BfsSampler(Sampler):
   """BFS sampler."""
+  CAN_TRUNCATE_INPUT_DATA = False
 
   def _sample_data(
       self,
@@ -441,6 +498,7 @@ class BfsSampler(Sampler):
 
 class TopoSampler(Sampler):
   """Topological Sorting sampler."""
+  CAN_TRUNCATE_INPUT_DATA = False
 
   def _sample_data(
       self,
@@ -455,6 +513,7 @@ class TopoSampler(Sampler):
 
 class ArticulationSampler(Sampler):
   """Articulation Point sampler."""
+  CAN_TRUNCATE_INPUT_DATA = False
 
   def _sample_data(
       self,
@@ -469,6 +528,7 @@ class ArticulationSampler(Sampler):
 
 class MSTSampler(Sampler):
   """MST sampler for Kruskal's algorithm."""
+  CAN_TRUNCATE_INPUT_DATA = True
 
   def _sample_data(
       self,
@@ -490,6 +550,7 @@ class MSTSampler(Sampler):
 
 class BellmanFordSampler(Sampler):
   """Bellman-Ford sampler."""
+  CAN_TRUNCATE_INPUT_DATA = True
 
   def _sample_data(
       self,
@@ -512,6 +573,7 @@ class BellmanFordSampler(Sampler):
 
 class DAGPathSampler(Sampler):
   """Sampler for DAG shortest paths."""
+  CAN_TRUNCATE_INPUT_DATA = True
 
   def _sample_data(
       self,
@@ -534,6 +596,7 @@ class DAGPathSampler(Sampler):
 
 class FloydWarshallSampler(Sampler):
   """Sampler for all-pairs shortest paths."""
+  CAN_TRUNCATE_INPUT_DATA = True
 
   def _sample_data(
       self,
@@ -555,6 +618,7 @@ class FloydWarshallSampler(Sampler):
 
 class SccSampler(Sampler):
   """Sampler for strongly connected component (SCC) tasks."""
+  CAN_TRUNCATE_INPUT_DATA = False
 
   def _sample_data(
       self,
@@ -571,6 +635,7 @@ class SccSampler(Sampler):
 
 class BipartiteSampler(Sampler):
   """Sampler for bipartite matching-based flow networks."""
+  CAN_TRUNCATE_INPUT_DATA = False
 
   def _sample_data(
       self,
@@ -589,6 +654,7 @@ class BipartiteSampler(Sampler):
 
 class MatcherSampler(Sampler):
   """String matching sampler; embeds needle in a random haystack."""
+  CAN_TRUNCATE_INPUT_DATA = False
 
   def _sample_data(
       self,
@@ -613,6 +679,7 @@ class MatcherSampler(Sampler):
 
 class SegmentsSampler(Sampler):
   """Two-segment sampler of points from (U[0, 1], U[0, 1])."""
+  CAN_TRUNCATE_INPUT_DATA = True
 
   def _sample_data(self, length: int, low: float = 0., high: float = 1.):
     del length  # There are exactly four endpoints.
@@ -639,20 +706,119 @@ class SegmentsSampler(Sampler):
     return [xs, ys]
 
 
+def _cross2d(x: np.ndarray, y: np.ndarray) -> np.ndarray:
+  """Computes the cross product of two 2D vectors.
+
+  Args:
+    x: The first 2D vector.
+    y: The second 2D vector.
+
+  Returns:
+    The cross product of the two vectors.
+  """
+  return x[..., 0] * y[..., 1] - x[..., 1] * y[..., 0]
+
+
+def _is_collinear(
+    point_1: np.ndarray,
+    point_2: np.ndarray,
+    point_3: np.ndarray,
+    eps: float,
+) -> bool:
+  """Checks if three points are collinear.
+
+  Args:
+    point_1: The first point.
+    point_2: The second point.
+    point_3: The third point.
+    eps: The tolerance for collinearity.
+
+  Returns:
+    True if the three points are collinear, False otherwise.
+
+  Raises:
+    ValueError: If any of the points is not a 2D vector.
+  """
+  for point in [point_1, point_2, point_3]:
+    if point.shape != (2,):
+      raise ValueError(f'Point {point} is not a 2D vector.')
+
+  # Vectors from p1
+  v_1 = point_2 - point_1
+  v_2 = point_3 - point_1
+
+  cross_val = _cross2d(v_1, v_2)
+
+  return bool(abs(cross_val) < eps)
+
+
 class ConvexHullSampler(Sampler):
   """Convex hull sampler of points over a disk of radius r."""
+  CAN_TRUNCATE_INPUT_DATA = True
 
-  def _sample_data(self, length: int, origin_x: float = 0.,
-                   origin_y: float = 0., radius: float = 2.):
+  def _sample_data(
+      self,
+      length: int,
+      origin_x: float = 0.0,
+      origin_y: float = 0.0,
+      radius: float = 2.0,
+      collinearity_resampling_attempts: int = 1000,
+      collineararity_eps: float = 1e-12,
+  ):
+    """Samples a convex hull of points over a disk of radius r.
 
-    thetas = self._random_sequence(length=length, low=0.0, high=2.0 * np.pi)
-    rs = radius * np.sqrt(
-        self._random_sequence(length=length, low=0.0, high=1.0))
+    Args:
+      length: The number of points to sample.
+      origin_x: The x-coordinate of the origin of the disk.
+      origin_y: The y-coordinate of the origin of the disk.
+      radius: The radius of the disk.
+      collinearity_resampling_attempts: The number of times to resample if
+        collinear points are found.
+      collineararity_eps: The tolerance for collinearity.
 
-    xs = rs * np.cos(thetas) + origin_x
-    ys = rs * np.sin(thetas) + origin_y
+    Returns:
+      A list of the sampled points.
 
-    return [xs, ys]
+    Raises:
+      RuntimeError: If it could not sample stable points within the specified
+        number of attempts.
+    """
+    for _ in range(collinearity_resampling_attempts):
+      thetas = self._random_sequence(
+          length=length,
+          low=0.0,
+          high=2.0 * np.pi,
+      )
+      rs = radius * np.sqrt(
+          self._random_sequence(length=length, low=0.0, high=1.0)
+      )
+
+      xs = rs * np.cos(thetas) + origin_x
+      ys = rs * np.sin(thetas) + origin_y
+
+      # Sampler._make_batch may do truncation of the input data after
+      # calling _sample_data.
+      # Truncation can lead to collinearity of points, which in turn leads to
+      # numerous correct traces in the Graham scan algorithm. To prevent this,
+      # we check for collinearity and resample if collinear points are found.
+      xs = self._trunc_array(xs)
+      ys = self._trunc_array(ys)
+
+      collinear_found = False
+      points = np.stack([xs, ys], axis=1)
+      for point_1, point_2, point_3 in itertools.combinations(points, 3):
+        if _is_collinear(point_1, point_2, point_3, collineararity_eps):
+          collinear_found = True
+          break
+
+      if collinear_found:
+        continue
+
+      return [xs, ys]
+
+    raise RuntimeError(
+        f'Could not sample {length} stable points within {10000} tries.'
+    )
 
 
 SAMPLERS = {
@@ -753,7 +919,7 @@ def _batch_hints(
         assert hint_lengths[sample_idx] == cur_length
       else:
         hint_lengths[sample_idx] = cur_length
-  return batched_traj, hint_lengths
+  return batched_traj, hint_lengths  # pyrefly: ignore[bad-return]
 
 
 def _subsample_data(
@@ -766,7 +932,7 @@ def _subsample_data(
   for dp in trajectory:
     sampled_data = np.take(dp.data, idx, axis=axis)
     sampled_traj.append(
-        probing.DataPoint(dp.name, dp.location, dp.type_, sampled_data))
+        probing.DataPoint(dp.name, dp.location, dp.type_, sampled_data))  # pyrefly: ignore[bad-argument-count]
   return sampled_traj
 
 
@@ -782,19 +948,19 @@ def _preprocess_permutations(probes, enforce_permutations):
       new_x, mask = probing.predecessor_to_cyclic_predecessor_and_first(x.data)
       output.append(
           probing.DataPoint(
-              name=x.name,
-              location=x.location,
-              type_=specs.Type.PERMUTATION_POINTER,
-              data=new_x))
+              name=x.name,  # pyrefly: ignore[unexpected-keyword]
+              location=x.location,  # pyrefly: ignore[unexpected-keyword]
+              type_=specs.Type.PERMUTATION_POINTER,  # pyrefly: ignore[unexpected-keyword]
+              data=new_x))  # pyrefly: ignore[unexpected-keyword]
       output.append(
           probing.DataPoint(
-              name=x.name + '_mask',
-              location=x.location,
-              type_=specs.Type.MASK_ONE,
-              data=mask))
+              name=x.name + '_mask',  # pyrefly: ignore[unexpected-keyword]
+              location=x.location,  # pyrefly: ignore[unexpected-keyword]
+              type_=specs.Type.MASK_ONE,  # pyrefly: ignore[unexpected-keyword]
+              data=mask))  # pyrefly: ignore[unexpected-keyword]
     else:
-      output.append(probing.DataPoint(name=x.name, location=x.location,
-                                      type_=specs.Type.POINTER, data=x.data))
+      output.append(probing.DataPoint(name=x.name, location=x.location,  # pyrefly: ignore[unexpected-keyword]
+                                      type_=specs.Type.POINTER, data=x.data))  # pyrefly: ignore[unexpected-keyword]
   return output
 
 
@@ -843,8 +1009,8 @@ def process_pred_as_input(spec, sample_iterator):
           assert np.sum(np.abs(pred_h.data[1:int(features.lengths[i]), i] -
                                pred_h.data[0, i])) == 0.0
         inputs = tuple(features.inputs) + (
-            probing.DataPoint(name='pred', location=pred_h.location,
-                              type_=pred_h.type_, data=pred_h.data[0]),)
+            probing.DataPoint(name='pred', location=pred_h.location,  # pyrefly: ignore[unexpected-keyword]
+                              type_=pred_h.type_, data=pred_h.data[0]),)  # pyrefly: ignore[unexpected-keyword]
         features = features._replace(inputs=tuple(inputs),
                                      hints=tuple(hints))
         feedback = feedback._replace(features=features)
